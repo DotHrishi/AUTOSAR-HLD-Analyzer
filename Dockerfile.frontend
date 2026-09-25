@@ -1,0 +1,15 @@
+# Frontend Dockerfile — Streamlit UI
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir streamlit requests pandas python-dotenv plotly
+
+COPY app/frontend ./app/frontend
+COPY app/__init__.py ./app/__init__.py
+COPY .env.example .env
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "app/frontend/app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]

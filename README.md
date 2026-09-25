@@ -61,8 +61,7 @@
 ### 1. Clone & Setup Virtual Environment
 ```bash
 # Clone repository
-git clone https://github.com/DotHrishi/unified-code-review.git
-cd AUTOSAR-HLD-Analyzer
+git clone https://github.com/DotHrishi/AUTOSAR-HLD-Analyzer.git
 
 # Create and activate virtual environment
 python -m venv venv
@@ -111,13 +110,13 @@ python test_pipeline.py
 
 **Terminal 1 — Start FastAPI Backend:**
 ```bash
-uvicorn app.backend.main:app --host 127.0.0.1 --port 8000 --reload
+python -m uvicorn app.backend.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 API Documentation will be available at: `http://127.0.0.1:8000/docs`
 
 **Terminal 2 — Start Streamlit Frontend:**
 ```bash
-streamlit run app/frontend/app.py
+python -m streamlit run app/frontend/app.py
 ```
 Open your browser at: `http://localhost:8501`
 
@@ -174,5 +173,6 @@ AUTOSAR-HLD-Analyzer/
 
 ## 🛡️ License & Disclaimers
 This prototype is developed for technical demonstration purposes in automotive software architecture analysis. Fictional sample components and ports comply with AUTOSAR 4.4 and ISO 26262 conceptual patterns.
-#   A U T O S A R - H L D - A n a l y z e r  
+#   A U T O S A R - H L D - A n a l y z e r 
+ 
  

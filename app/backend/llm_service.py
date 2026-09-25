@@ -12,6 +12,8 @@ import requests
 from typing import Optional, Dict, Any
 from app.backend.config import (
     LLM_PROVIDER,
+    GROQ_API_KEY,
+    GROQ_MODEL,
     OPENAI_API_KEY,
     OPENAI_MODEL,
     ANTHROPIC_API_KEY,
@@ -33,6 +35,34 @@ class BaseLLMService(abc.ABC):
     ) -> str:
         """Generates a text completion based on system instructions and user context."""
         pass
+
+
+class GroqLLMService(BaseLLMService):
+    """Groq API Provider (e.g., openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.8-27b)."""
+
+    def __init__(self, api_key: str, model: str = "openai/gpt-oss-120b"):
+        from openai import OpenAI
+        self.client = OpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=api_key
+        )
+        self.model = model or "openai/gpt-oss-120b"
+
+    def generate_response(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.1
+    ) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=temperature
+        )
+        return response.choices[0].message.content or ""
 
 
 class OpenAILLMService(BaseLLMService):
@@ -259,21 +289,36 @@ def get_llm_service() -> BaseLLMService:
     Factory function returning the active LLM service based on environment configuration.
     Falls back to MockLLMService if requested API key is missing or provider is 'mock'.
     """
-    provider = LLM_PROVIDER.lower()
+    provider = os.getenv("LLM_PROVIDER", LLM_PROVIDER).lower()
+    groq_key = os.getenv("GROQ_API_KEY", GROQ_API_KEY)
+    groq_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    openai_key = os.getenv("OPENAI_API_KEY", OPENAI_API_KEY)
+    openai_model = os.getenv("OPENAI_MODEL", OPENAI_MODEL)
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)
+    anthropic_model = os.getenv("ANTHROPIC_MODEL", ANTHROPIC_MODEL)
 
-    if provider == "openai":
-        if OPENAI_API_KEY and OPENAI_API_KEY != "your_openai_api_key_here":
+    if provider == "groq":
+        if groq_key:
             try:
-                return OpenAILLMService(api_key=OPENAI_API_KEY, model=OPENAI_MODEL)
+                return GroqLLMService(api_key=groq_key, model=groq_model)
+            except Exception as e:
+                print(f"[LLMService] Groq init error: {e}. Falling back to Mock service.")
+        else:
+            print("[LLMService] GROQ_API_KEY not configured. Falling back to Mock service.")
+
+    elif provider == "openai":
+        if openai_key and openai_key != "your_openai_api_key_here":
+            try:
+                return OpenAILLMService(api_key=openai_key, model=openai_model)
             except Exception as e:
                 print(f"[LLMService] OpenAI init error: {e}. Falling back to Mock service.")
         else:
             print("[LLMService] OPENAI_API_KEY not configured. Falling back to Mock service.")
 
     elif provider == "anthropic":
-        if ANTHROPIC_API_KEY and ANTHROPIC_API_KEY != "your_anthropic_api_key_here":
+        if anthropic_key and anthropic_key != "your_anthropic_api_key_here":
             try:
-                return AnthropicLLMService(api_key=ANTHROPIC_API_KEY, model=ANTHROPIC_MODEL)
+                return AnthropicLLMService(api_key=anthropic_key, model=anthropic_model)
             except Exception as e:
                 print(f"[LLMService] Anthropic init error: {e}. Falling back to Mock service.")
         else:

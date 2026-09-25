@@ -4,6 +4,7 @@ Validates extracted AUTOSAR architecture entities against structural rules
 and pairs findings with LLM-generated engineering explanations and human review workflows.
 """
 
+import json
 from typing import List, Dict, Any
 from app.backend.entity_extractor import extract_architecture_entities
 from app.backend.llm_service import get_llm_service
@@ -134,12 +135,75 @@ def _run_deterministic_rules(doc_id: str, components: List[Dict[str, Any]]) -> L
 
 
 def _enrich_findings_with_llm(doc_id: str, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Enhances findings with contextual engineering insights from the LLM."""
+    """
+    Enhances each deterministic finding with LLM-generated root-cause analysis,
+    safety-impact statement, and refined engineering remediation advice.
+    Falls back to original deterministic text if the LLM call fails.
+    """
     if not findings:
         return []
 
     llm = get_llm_service()
-    
-    # In mock mode, the deterministic findings already have high quality text
-    # In live LLM mode, we can optionally refine the explanation text
-    return findings
+    enriched = []
+
+    for i, finding in enumerate(findings):
+        # Cap LLM enrichment to top 5 findings to avoid ingestion latency spikes
+        if i >= 5:
+            enriched.append(dict(finding))
+            continue
+
+        try:
+            system_prompt = (
+                "You are a senior AUTOSAR systems architect and ISO 26262 functional safety expert. "
+                "You are reviewing an automatically detected architectural inconsistency in a High-Level Design document. "
+                "Provide a concise, technically precise engineering analysis. "
+                "Your response must be a valid JSON object with exactly these fields: "
+                "\"root_cause\", \"safety_impact\", \"remediation\". "
+                "No markdown, no fences, no extra keys."
+            )
+            user_prompt = (
+                f"Architectural issue detected in document '{doc_id}':\n\n"
+                f"Issue Type: {finding.get('issue_type')}\n"
+                f"Severity: {finding.get('severity')}\n"
+                f"Component: {finding.get('component_name')}\n"
+                f"Summary: {finding.get('summary')}\n"
+                f"Description: {finding.get('description')}\n"
+                f"Evidence: Page {finding.get('evidence_page')}, Section: {finding.get('evidence_section')}\n\n"
+                "Provide:\n"
+                "1. root_cause: The likely architectural root cause of this issue (1-2 sentences).\n"
+                "2. safety_impact: Potential ISO 26262 / ASIL safety impact if this issue is not resolved (1-2 sentences).\n"
+                "3. remediation: Specific, actionable engineering remediation steps (2-4 sentences).\n\n"
+                "Respond ONLY with a JSON object: {\"root_cause\": \"...\", \"safety_impact\": \"...\", \"remediation\": \"...\"}"
+            )
+
+            raw = llm.generate_response(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.1
+            ).strip()
+
+            # Strip markdown fences if LLM wraps the JSON
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
+
+            enrichment = json.loads(raw)
+            finding = dict(finding)  # shallow copy to avoid mutating original
+            if enrichment.get("root_cause"):
+                finding["root_cause"] = enrichment["root_cause"]
+            if enrichment.get("safety_impact"):
+                finding["safety_impact"] = enrichment["safety_impact"]
+            if enrichment.get("remediation"):
+                # Prefer LLM remediation over the deterministic one when available
+                finding["remediation"] = enrichment["remediation"]
+
+        except Exception as e:
+            # LLM enrichment is best-effort; deterministic data is always the safety net
+            print(f"[InconsistencyChecker] LLM enrichment skipped for finding "
+                  f"'{finding.get('id')}': {e}")
+
+        enriched.append(finding)
+
+    return enriched

@@ -4,11 +4,29 @@ Comprehensive Automotive Architecture AI Workbench.
 """
 
 import os
+import sys
 import io
+import json
+from pathlib import Path
 import pandas as pd
 import streamlit as st
 from datetime import datetime
-from app.frontend.api_client import APIClient
+
+try:
+    import plotly.graph_objects as go
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
+
+# Ensure project root is in sys.path
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+try:
+    from app.frontend.api_client import APIClient
+except ImportError:
+    from api_client import APIClient
 
 # Page configuration
 st.set_page_config(
@@ -27,7 +45,7 @@ st.markdown("""
     .main-header {
         font-size: 1.8rem;
         font-weight: 700;
-        color: #1E3A8A;
+        color: #00FF66;
         margin-bottom: 0.2rem;
     }
     .sub-header {
@@ -149,7 +167,7 @@ with tab_upload:
             title_input = st.text_input("Document Title (Optional)", placeholder="Powertrain Domain HLD")
 
         if uploaded_file and st.button("🚀 Ingest & Index Document", type="primary"):
-            with st.spinner("Parsing PDF pages, chunking with section provenance, and embedding into ChromaDB..."):
+            with st.spinner("Processing PDF (parsing pages, generating vector embeddings, and extracting architecture)... For large 500+ page specifications, this may take 1-2 minutes..."):
                 try:
                     bytes_data = uploaded_file.getvalue()
                     res = api.upload_document(
@@ -298,15 +316,26 @@ with tab_entities:
 
                 st.dataframe(filtered_df, use_container_width=True)
 
-                # Export CSV button
+                # Export buttons — CSV and structured JSON
+                col_exp1, col_exp2 = st.columns(2)
                 csv_buffer = io.StringIO()
                 filtered_df.to_csv(csv_buffer, index=False)
-                st.download_button(
-                    label="📥 Export Architecture Entities to CSV",
+                col_exp1.download_button(
+                    label="📥 Export Entities to CSV",
                     data=csv_buffer.getvalue(),
                     file_name=f"autosar_entities_{selected_doc_id}.csv",
                     mime="text/csv"
                 )
+                try:
+                    json_export = api.export_entities_json(selected_doc_id)
+                    col_exp2.download_button(
+                        label="📦 Export Entities to JSON (Toolchain)",
+                        data=json.dumps(json_export, indent=2),
+                        file_name=f"autosar_entities_{selected_doc_id}.json",
+                        mime="application/json"
+                    )
+                except Exception:
+                    pass
 
                 # Functional flows
                 flows = ent_data.get("functional_flows", [])
@@ -399,6 +428,21 @@ with tab_inconsistencies:
         except Exception as e:
             st.error(f"Inconsistency analysis error: {e}")
 
+    # JSON export for the full inconsistency report
+    if selected_doc_id:
+        try:
+            st.divider()
+            col_jexp1, _ = st.columns([1, 3])
+            json_inc_export = api.export_inconsistencies_json(selected_doc_id)
+            col_jexp1.download_button(
+                label="📦 Export Findings to JSON (Issue Tracker / FMEA)",
+                data=json.dumps(json_inc_export, indent=2),
+                file_name=f"autosar_inconsistencies_{selected_doc_id}.json",
+                mime="application/json"
+            )
+        except Exception:
+            pass
+
 
 # ----------------- TAB 5: REVISION COMPARISON -----------------
 with tab_compare:
@@ -452,26 +496,117 @@ with tab_compare:
 # ----------------- TAB 6: GRAPH & IMPACT ANALYSIS -----------------
 with tab_graph:
     st.subheader("6. Architecture Dependency Graph & Blast Radius Impact Analysis")
-    
+
     if not selected_doc_id:
         st.warning("Please select a document from the sidebar.")
     else:
         try:
             ent_data = api.get_entities(selected_doc_id)
-            components = [c["name"] for c in ent_data.get("components", [])]
+            components = ent_data.get("components", [])
+            component_names = [c["name"] for c in components]
 
-            if not components:
+            if not component_names:
                 st.info("No components found in document.")
             else:
+                # ---- Inline Plotly Network Graph ----
+                if HAS_PLOTLY and components:
+                    st.markdown("#### Architecture Dependency Graph")
+                    st.caption("Arrows represent Provide→Require port dependencies between SWCs.")
+
+                    # Build edge list from ports
+                    edges = []
+                    for comp in components:
+                        for port in comp.get("ports", []):
+                            if port.get("type") == "Provide":
+                                provider = port.get("provider", "")
+                                if provider and provider not in ("External", "-", ""):
+                                    edges.append((comp["name"], provider, port.get("interface", "")))
+
+                    # Node positions (circular layout)
+                    import math
+                    n = len(component_names)
+                    angle_step = 2 * math.pi / max(n, 1)
+                    pos = {
+                        name: (math.cos(i * angle_step) * 2, math.sin(i * angle_step) * 2)
+                        for i, name in enumerate(component_names)
+                    }
+
+                    # Safety level color map
+                    asil_colors = {
+                        "ASIL-D": "#EF4444", "ASIL-C": "#F97316",
+                        "ASIL-B": "#EAB308", "ASIL-A": "#22C55E", "QM": "#6B7280"
+                    }
+
+                    # Edge traces
+                    edge_traces = []
+                    for src, dst, iface in edges:
+                        x0, y0 = pos.get(src, (0, 0))
+                        x1, y1 = pos.get(dst, (0, 0))
+                        edge_traces.append(go.Scatter(
+                            x=[x0, x1, None], y=[y0, y1, None],
+                            mode="lines",
+                            line=dict(width=1.5, color="#94A3B8"),
+                            hoverinfo="text",
+                            text=iface,
+                            showlegend=False
+                        ))
+
+                    # Node trace
+                    node_x = [pos[n][0] for n in component_names]
+                    node_y = [pos[n][1] for n in component_names]
+                    node_colors = [
+                        asil_colors.get(
+                            next((c["safety_level"] for c in components if c["name"] == n), "QM"),
+                            "#6B7280"
+                        )
+                        for n in component_names
+                    ]
+                    node_text = [
+                        f"<b>{c['name']}</b><br>Type: {c.get('type','')}<br>"
+                        f"Periodicity: {c.get('periodicity','')}<br>ASIL: {c.get('safety_level','')}<br>"
+                        f"Ports: {len(c.get('ports',[]))}"
+                        for c in components
+                    ]
+                    node_trace = go.Scatter(
+                        x=node_x, y=node_y,
+                        mode="markers+text",
+                        marker=dict(size=28, color=node_colors, line=dict(width=2, color="white")),
+                        text=component_names,
+                        textposition="top center",
+                        hoverinfo="text",
+                        hovertext=node_text,
+                        showlegend=False
+                    )
+
+                    fig = go.Figure(
+                        data=edge_traces + [node_trace],
+                        layout=go.Layout(
+                            paper_bgcolor="#0F172A",
+                            plot_bgcolor="#0F172A",
+                            font=dict(color="white"),
+                            margin=dict(l=20, r=20, t=20, b=20),
+                            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                            height=480,
+                        )
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.caption("🔴 ASIL-D  🟠 ASIL-C  🟡 ASIL-B  🟢 ASIL-A  ⚫ QM")
+
+                st.divider()
+
+                # ---- Blast Radius Analysis ----
                 col_g1, col_g2 = st.columns([2, 1])
-                target_swc = col_g1.selectbox("Select Target Component to analyze change blast radius:", components)
-                
+                target_swc = col_g1.selectbox(
+                    "Select Target Component for change blast radius:", component_names
+                )
+
                 if col_g2.button("💥 Calculate Blast Radius Impact"):
                     impact = api.get_component_impact(selected_doc_id, target_swc)
-                    
+
                     st.markdown(f"### Impact Analysis for `{target_swc}`")
                     col_i1, col_i2 = st.columns(2)
-                    
+
                     with col_i1:
                         st.markdown("#### ⬅️ Upstream Dependencies (What it relies on)")
                         upstreams = impact.get("upstream_dependencies", [])
@@ -482,7 +617,7 @@ with tab_graph:
                             st.write("No upstream SWC dependencies.")
 
                     with col_i2:
-                        st.markdown("#### ➡️ Downstream Blast Radius (What will be affected by a change)")
+                        st.markdown("#### ➡️ Downstream Blast Radius (What will be affected)")
                         downstreams = impact.get("downstream_impact", [])
                         if downstreams:
                             for d in downstreams:
@@ -491,10 +626,22 @@ with tab_graph:
                             st.write("No downstream consumers.")
 
                 st.divider()
+
+                # ---- Neo4j Cypher Export ----
                 st.markdown("#### Neo4j Cypher Graph Script Export")
-                st.caption("Copy and execute this script directly in Neo4j Browser to visualize full architecture topology.")
+                st.caption(
+                    "Copy and execute in Neo4j Browser to visualize full architecture topology. "
+                    "Or download and import into your graph database."
+                )
                 cypher_code = api.get_cypher_export(selected_doc_id)
-                st.code(cypher_code, language="cypher")
+                col_cy1, col_cy2 = st.columns([3, 1])
+                col_cy1.code(cypher_code, language="cypher")
+                col_cy2.download_button(
+                    label="📥 Download Cypher Script",
+                    data=cypher_code,
+                    file_name=f"architecture_{selected_doc_id}.cypher",
+                    mime="text/plain"
+                )
 
         except Exception as e:
             st.error(f"Graph error: {e}")

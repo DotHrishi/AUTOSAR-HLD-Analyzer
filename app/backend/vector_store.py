@@ -72,24 +72,26 @@ def index_chunks(doc_id: str, chunks: List[Dict[str, Any]]) -> int:
     if not chunks:
         return 0
 
-    ids = [c["chunk_id"] for c in chunks]
-    documents = [c["text"] for c in chunks]
-    metadatas = [
-        {
-            "doc_id": c.get("doc_id", doc_id),
-            "page_number": int(c.get("page_number", 1)),
-            "section_title": str(c.get("section_title", "")),
-            "word_count": int(c.get("word_count", 0)),
-            "chunk_id": str(c.get("chunk_id", ""))
-        }
-        for c in chunks
-    ]
-
-    collection.add(
-        ids=ids,
-        documents=documents,
-        metadatas=metadatas
-    )
+    batch_size = 150
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i:i + batch_size]
+        batch_ids = [c["chunk_id"] for c in batch]
+        batch_docs = [c["text"] for c in batch]
+        batch_metas = [
+            {
+                "doc_id": c.get("doc_id", doc_id),
+                "page_number": int(c.get("page_number", 1)),
+                "section_title": str(c.get("section_title", "")),
+                "word_count": int(c.get("word_count", 0)),
+                "chunk_id": str(c.get("chunk_id", ""))
+            }
+            for c in batch
+        ]
+        collection.add(
+            ids=batch_ids,
+            documents=batch_docs,
+            metadatas=batch_metas
+        )
 
     return len(chunks)
 

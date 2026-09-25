@@ -18,7 +18,12 @@ from app.backend.database import (
 
 GENERIC_SWC_NAMES = {
     "APPLICATIONSWC", "SENSORACTUATORSWC", "SERVICESWC",
-    "COMPLEXDEVICEDRIVERSWC", "ECUABSTRACTIONSWC", "SWC"
+    "COMPLEXDEVICEDRIVERSWC", "ECUABSTRACTIONSWC", "SWC",
+    "SOFTWARECOMPONENT", "COMPONENT", "AUTOSAR", "ARCHITECTURE",
+    "SYSTEM", "MODULE", "INTERFACE", "PORT", "MODEL", "TEMPLATE",
+    "PACKAGE", "SPECIFICATION", "STANDARD", "DOCUMENT", "ELEMENT",
+    "FIGURE", "TABLE", "SECTION", "CHAPTER", "PAGE", "RELEASE",
+    "VERSION", "REQUIRE", "PROVIDE"
 }
 
 
@@ -29,7 +34,7 @@ def extract_architecture_entities(doc_id: str, force_refresh: bool = False) -> D
     """
     if not force_refresh:
         cached = get_cached_extracted_entities(doc_id)
-        if cached:
+        if cached and cached.get("components"):
             return cached
 
     doc_meta = get_document_by_id(doc_id)
@@ -44,10 +49,22 @@ def extract_architecture_entities(doc_id: str, force_refresh: bool = False) -> D
 
     # 2. LLM-assisted refinement pass if active
     llm = get_llm_service()
-    full_text = "\n\n".join([f"--- Page {p['page_number']} ---\n{p['text']}" for p in parsed_pdf.get("pages", [])])
+    pages = parsed_pdf.get("pages", [])
+    if len(pages) > 10:
+        relevant_pages = []
+        for p in pages:
+            txt = p.get("text", "")
+            if any(k in txt for k in ["Software Component", "SWC", "P-Port", "R-Port", "ASIL", "ClientServer", "SenderReceiver"]):
+                relevant_pages.append(f"--- Page {p['page_number']} ---\n{txt}")
+                if sum(len(x) for x in relevant_pages) > 5000:
+                    break
+        context_text = "\n\n".join(relevant_pages) if relevant_pages else "\n\n".join([f"--- Page {p['page_number']} ---\n{p['text']}" for p in pages[:5]])
+        context_text = context_text[:5000]
+    else:
+        context_text = "\n\n".join([f"--- Page {p['page_number']} ---\n{p['text']}" for p in pages])[:5000]
     
     extraction_prompt = f"""You are an AUTOSAR Architecture Model Extractor.
-Extract all Software Components, Ports, Interfaces, Signals, Data Types, and Dependencies from this document into valid JSON.
+Extract Software Components, Ports, Interfaces, Signals, and Dependencies from this document excerpt into valid JSON.
 
 JSON Schema:
 {{
@@ -80,8 +97,8 @@ JSON Schema:
   ]
 }}
 
-DOCUMENT TEXT:
-{full_text}
+DOCUMENT EXCERPT:
+{context_text}
 """
     final_components = deterministic_model.get("components", [])
     final_flows = deterministic_model.get("functional_flows", [])
@@ -141,108 +158,98 @@ def _clean_text_lines(text: str) -> List[str]:
 
 def _extract_deterministic_entities(parsed_pdf: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Deterministic rule-based extractor using regular expressions to parse AUTOSAR tables.
+    Deterministic rule-based extractor using regular expressions to parse AUTOSAR components, ports, and flows.
     """
-    components: List[Dict[str, Any]] = []
+    components: Dict[str, Dict[str, Any]] = {}
     flows: List[Dict[str, Any]] = []
+
+    swc_patterns = [
+        # Explicit labels: 'Software Component: BrakeControlSWC' or 'SWC: BrakeControl'
+        r'(?:Software\s+Component|Component|SWC|SW-C)\s*:\s*([A-Za-z0-9_]+)',
+        # Pattern ending in SWC or Swc: 'BrakeControlSWC'
+        r'\b([A-Z][a-zA-Z0-9_]+(?:SWC|Swc))\b',
+        # Standard AUTOSAR types: 'ApplicationSwComponentType', 'CompositionSwComponentType'
+        r'\b([A-Z][a-zA-Z0-9_]+(?:SwComponentType|ComponentType))\b',
+        # Standard AUTOSAR managers / controllers
+        r'\b(AUTOSAR_SWS_[A-Za-z0-9_]+|[A-Z][a-zA-Z0-9_]+(?:StateManager|ModeManager|WatchdogManager|COMManager|TimeBaseManager|InhibitionManager))\b'
+    ]
 
     for page in parsed_pdf.get("pages", []):
         page_num = page["page_number"]
         text = page["text"]
         lines = _clean_text_lines(text)
 
-        current_swc: Optional[Dict[str, Any]] = None
+        current_swc_name: Optional[str] = None
 
         for idx, line in enumerate(lines):
-            # 1. Detect explicit Component Definition Headers
-            # e.g. "2. Software Component: BrakeControlSWC" or "Software Component: EngineManagerSWC"
-            swc_header_match = re.search(r'(?:[0-9]+\.\s*)?Software Component:\s*([A-Za-z0-9_]+SWC)', line, re.IGNORECASE)
-            
-            if swc_header_match:
-                swc_name = swc_header_match.group(1).strip()
-                if swc_name.upper() not in GENERIC_SWC_NAMES:
-                    # Look ahead for component metadata
-                    swc_type = "ApplicationSWC"
-                    periodicity = "10ms"
-                    safety = "ASIL-B"
-                    
-                    for look in lines[idx:min(len(lines), idx+8)]:
-                        if "SensorActuatorSWC" in look or "Sensor/Actuator" in look:
-                            swc_type = "SensorActuatorSWC"
-                        elif "ApplicationSWC" in look or "Application Software" in look:
-                            swc_type = "ApplicationSWC"
-                        if "ASIL-D" in look:
-                            safety = "ASIL-D"
-                        elif "ASIL-C" in look:
-                            safety = "ASIL-C"
-                        elif "ASIL-B" in look:
-                            safety = "ASIL-B"
-                        period_match = re.search(r'(\d+ms)', look)
-                        if period_match:
-                            periodicity = period_match.group(1)
+            # 1. Detect Component definitions
+            for pat in swc_patterns:
+                for match in re.finditer(pat, line, re.IGNORECASE):
+                    raw_name = match.group(1).strip()
+                    clean_name = raw_name.replace("AUTOSAR_SWS_", "")
+                    if (len(clean_name) >= 3 and
+                        clean_name.upper() not in GENERIC_SWC_NAMES and
+                        not clean_name.startswith(("http", "www", "Figure", "Table", "Release", "Version", "Document"))):
 
-                    current_swc = {
-                        "name": swc_name,
-                        "type": swc_type,
-                        "periodicity": periodicity,
-                        "safety_level": safety,
-                        "page": page_num,
-                        "section": f"Component: {swc_name}",
-                        "ports": []
-                    }
-                    
-                    # Deduplicate or replace
-                    existing_idx = next((i for i, c in enumerate(components) if c["name"] == swc_name), -1)
-                    if existing_idx == -1:
-                        components.append(current_swc)
-                    else:
-                        current_swc = components[existing_idx]
+                        current_swc_name = clean_name
+                        if clean_name not in components:
+                            swc_type = "SensorActuatorSWC" if ("Sensor" in clean_name or "Actuator" in clean_name) else (
+                                "ApplicationSWC" if ("App" in clean_name or "SWC" in clean_name) else "ServiceSWC"
+                            )
+                            safety = "ASIL-D" if "ASIL-D" in text else ("ASIL-C" if "ASIL-C" in text else ("ASIL-B" if "ASIL-B" in text else "ASIL-QM"))
+                            period = "10ms"
+                            pm = re.search(r'(\d+ms)', line)
+                            if pm:
+                                period = pm.group(1)
 
-            # 2. Detect Port definitions when inside a component section
-            port_match = re.search(r'([RP]Port_[A-Za-z0-9_]+)', line)
-            if port_match and current_swc:
+                            components[clean_name] = {
+                                "name": clean_name,
+                                "type": swc_type,
+                                "periodicity": period,
+                                "safety_level": safety,
+                                "page": page_num,
+                                "section": f"Component: {clean_name}",
+                                "ports": []
+                            }
+
+            # 2. Detect Ports
+            port_match = re.search(r'\b([RP]Port_[A-Za-z0-9_]+|[A-Za-z0-9_]+PortPrototype)\b', line)
+            if port_match and current_swc_name and current_swc_name in components:
                 p_name = port_match.group(1).strip()
-                p_type = "Require" if p_name.startswith("RPort") else "Provide"
-                
-                # Check if port is already recorded
-                if not any(p["name"] == p_name for p in current_swc["ports"]):
-                    # Scan following lines for port attributes
-                    if_name = f"If_{p_name[6:]}"
-                    signal_name = f"{p_name[6:]}"
+                p_type = "Require" if (p_name.startswith(("RPort", "Required")) or "Required" in p_name) else "Provide"
+                target_ports = components[current_swc_name]["ports"]
+                if not any(p["name"] == p_name for p in target_ports):
+                    if_name = f"If_{p_name}"
+                    signal_name = p_name
                     data_type = "uint16"
                     provider_target = "External"
 
-                    lookahead_lines = lines[idx:min(len(lines), idx+10)]
-                    
-                    # Search for Interface Name (If_...)
+                    lookahead_lines = lines[idx:min(len(lines), idx + 8)]
                     for l in lookahead_lines:
-                        if_m = re.search(r'\b(If_[A-Za-z0-9_]+)\b', l)
+                        if_m = re.search(r'\b(If_[A-Za-z0-9_]+|[A-Za-z0-9_]+Interface)\b', l)
                         if if_m:
                             if_name = if_m.group(1)
                             break
 
-                    # Search for Data Type
                     for l in lookahead_lines:
                         dt_m = re.search(r'\b(float32|uint16|uint8|uint32|boolean|sint16|sint32)\b', l)
                         if dt_m:
                             data_type = dt_m.group(1)
                             break
 
-                    # Search for Signal / Element Name
                     for l in lookahead_lines:
-                        sig_m = re.search(r'\b([A-Za-z0-9_]+(?:_kph|_Nm|_rpm|_deg|_pct|_A|_mps2|Percent|CurrentGear))\b', l)
+                        sig_m = re.search(r'\b([A-Za-z0-9_]+(?:_kph|_Nm|_rpm|_deg|_pct|_A|_mps2|Percent|CurrentGear|Speed|Torque|Pressure|Temp|Voltage))\b', l)
                         if sig_m:
                             signal_name = sig_m.group(1)
                             break
 
-                    # Search for Target / Provider SWC
                     for l in lookahead_lines:
                         tgt_m = re.search(r'\b([A-Za-z0-9_]+SWC)\b', l)
-                        if tgt_m and tgt_m.group(1) != current_swc["name"] and tgt_m.group(1).upper() not in GENERIC_SWC_NAMES:
+                        if tgt_m and tgt_m.group(1) != current_swc_name and tgt_m.group(1).upper() not in GENERIC_SWC_NAMES:
                             provider_target = tgt_m.group(1)
                             break
 
-                    current_swc["ports"].append({
+                    target_ports.append({
                         "name": p_name,
                         "type": p_type,
                         "interface": if_name,
@@ -261,7 +268,7 @@ def _extract_deterministic_entities(parsed_pdf: Dict[str, Any]) -> Dict[str, Any
                 })
 
     return {
-        "components": components,
+        "components": list(components.values()),
         "functional_flows": flows
     }
 

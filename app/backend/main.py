@@ -6,11 +6,21 @@ and Graph Dependency Impact Analysis.
 """
 
 import os
+import sys
+import json
 import shutil
 import uuid
+from pathlib import Path
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Query
+
+# Ensure project root is in sys.path
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Query, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.backend.config import UPLOAD_DIR, LLM_PROVIDER
@@ -41,14 +51,44 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Enable CORS for local Streamlit frontend
+# ---------------------------------------------------------------------------
+# CORS — restrict to configured allowed origins (defaults to Streamlit port)
+# ---------------------------------------------------------------------------
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:8501,http://127.0.0.1:8501")
+ALLOWED_ORIGINS: List[str] = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# API Key Authentication — reads AUTOSAR_API_KEY from environment.
+# When the variable is unset or empty the middleware is a no-op so local
+# development works out of the box without configuration.
+# ---------------------------------------------------------------------------
+_API_KEY = os.getenv("AUTOSAR_API_KEY", "").strip()
+_UNPROTECTED_PATHS = {"/api/health", "/docs", "/openapi.json", "/redoc"}
+
+
+@app.middleware("http")
+async def api_key_middleware(request: Request, call_next):
+    """Enforces API key auth when AUTOSAR_API_KEY is configured."""
+    if _API_KEY and request.url.path not in _UNPROTECTED_PATHS:
+        provided_key = (
+            request.headers.get("X-API-Key")
+            or request.query_params.get("api_key")
+        )
+        if provided_key != _API_KEY:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized: invalid or missing API key. "
+                                   "Pass X-API-Key header or api_key query param."}
+            )
+    return await call_next(request)
 
 
 # Request & Response Models
@@ -273,3 +313,60 @@ def get_audit_queries(limit: int = Query(100, ge=1, le=500)):
 def get_audit_reviews(limit: int = Query(100, ge=1, le=500)):
     """Fetches the human review actions audit trail."""
     return get_review_audit_logs(limit=limit)
+
+
+# ---------------------------------------------------------------------------
+# Structured Export Endpoints — JSON and serialised formats for downstream
+# integration (traceability tools, safety case toolchains, CI pipelines).
+# ---------------------------------------------------------------------------
+
+@app.get("/api/export/entities/{doc_id}")
+def export_entities_json(doc_id: str, force_refresh: bool = Query(False)):
+    """
+    Exports all extracted architecture entities for a document as structured JSON.
+    Suitable for import into AUTOSAR toolchains, safety-case managers, or CI pipelines.
+    """
+    try:
+        data = extract_architecture_entities(doc_id, force_refresh=force_refresh)
+        doc = get_document_by_id(doc_id)
+        return {
+            "export_format": "autosar_hld_entities_v1",
+            "doc_id": doc_id,
+            "doc_title": doc.get("doc_title") if doc else doc_id,
+            "version_label": doc.get("version_label") if doc else "unknown",
+            "component_count": len(data.get("components", [])),
+            "components": data.get("components", []),
+            "functional_flows": data.get("functional_flows", []),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Entity export failed: {str(e)}")
+
+
+@app.get("/api/export/inconsistencies/{doc_id}")
+def export_inconsistencies_json(doc_id: str):
+    """
+    Exports all inconsistency findings with review status as structured JSON.
+    Suitable for import into issue trackers, FMEA tools, or audit systems.
+    """
+    try:
+        findings = run_inconsistency_analysis(doc_id)
+        doc = get_document_by_id(doc_id)
+        critical = [f for f in findings if f.get("severity") == "CRITICAL"]
+        high = [f for f in findings if f.get("severity") == "HIGH"]
+        return {
+            "export_format": "autosar_hld_inconsistencies_v1",
+            "doc_id": doc_id,
+            "doc_title": doc.get("doc_title") if doc else doc_id,
+            "version_label": doc.get("version_label") if doc else "unknown",
+            "summary": {
+                "total": len(findings),
+                "critical": len(critical),
+                "high": len(high),
+                "pending_review": len([f for f in findings if f.get("status") == "AI_FLAGGED"]),
+                "accepted": len([f for f in findings if f.get("status") == "ACCEPTED"]),
+                "rejected": len([f for f in findings if f.get("status") == "REJECTED"]),
+            },
+            "findings": findings,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Inconsistency export failed: {str(e)}")

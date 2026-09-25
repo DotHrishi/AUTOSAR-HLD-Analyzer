@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+
+app/data/autosar_analysis.db
+app/data/chroma_db/
+app/data/uploads/
+
+.venv/
+venv/
+
+sample_docs/
